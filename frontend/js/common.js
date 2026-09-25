@@ -40,7 +40,7 @@
   ];
 
   const PAGE_TITLES = {
-    graph: ["图可视化", "vis.js 缩放拖拽 · 路径高亮"],
+    graph: ["图可视化", "vis.js 缩放拖拽 · 路径高亮 · 社群折叠"],
     import: ["关系导入", "批量导入边 · 增量更新"],
     path: ["路径与共同好友", "BFS 最短路径 · 共同好友查询"],
     community: ["社群发现", "Louvain 结果着色"],

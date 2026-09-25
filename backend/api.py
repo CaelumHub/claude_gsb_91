@@ -21,6 +21,7 @@ Endpoint summary (all under ``/api``):
     POST   /api/import                {edges:[[u,v],...], source}
     GET    /api/graph                 ?limit&community&top
     GET    /api/graph/neighborhood    ?node&depth&limit
+    GET    /api/graph/community-view  ?expanded=1,2  (社群折叠聚合视图)
     GET    /api/path                  ?source&target&algorithm
     GET    /api/common-friends        ?source&target
     GET    /api/community             (cached)
@@ -248,6 +249,19 @@ class ApiRouter:
                 for u, v, w in graph.iter_edges()
             ]
             return 200, {"root": node, "depth": depth, "nodes": nodes, "edges": edges}
+
+        # --- community-collapsed graph view ---
+        if route == "/graph/community-view" and method == "GET":
+            expanded = set()
+            for part in str(query.get("expanded", "")).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    expanded.add(int(part))
+                except ValueError:
+                    continue
+            return 200, self.service.community_view(expanded=expanded)
 
         # --- shortest path ---
         if route == "/path" and method == "GET":

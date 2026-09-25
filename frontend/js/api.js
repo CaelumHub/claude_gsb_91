@@ -70,6 +70,7 @@
     // 图
     graph: (p) => request("GET", "/api/graph" + qs(p)),
     neighborhood: (p) => request("GET", "/api/graph/neighborhood" + qs(p)),
+    communityView: (p) => request("GET", "/api/graph/community-view" + qs(p)),
 
     // 路径 & 共同好友
     shortestPath: (source, target, algorithm) =>

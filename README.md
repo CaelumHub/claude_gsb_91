@@ -54,7 +54,7 @@ gsb3/
 │   ├── index.html              # 入口（跳转 graph.html）
 │   ├── users.html              # 1. 用户管理
 │   ├── import.html             # 2. 关系导入
-│   ├── graph.html              # 3. 图可视化（vis.js 缩放拖拽、路径高亮）
+│   ├── graph.html              # 3. 图可视化（vis.js 缩放拖拽、路径高亮、社群折叠展开）
 │   ├── path.html               # 4. 最短路径与共同好友查询
 │   ├── community.html          # 5. 社群发现（Louvain 着色）
 │   ├── recommend.html          # 6. 个性化推荐列表
@@ -130,6 +130,7 @@ gsb3/
 | POST | `/api/users/<id>/tags` | 设置用户标签 |
 | POST | `/api/import` | 批量导入边 |
 | GET | `/api/graph` · `/api/graph/neighborhood` | 全图 / 邻域子图 |
+| GET | `/api/graph/community-view?expanded=` | 社群折叠聚合视图（按展开集合生成） |
 | GET | `/api/path` · `/api/common-friends` | 最短路径 / 共同好友 |
 | GET/POST | `/api/community` · `/api/community/compute` | Louvain 结果 / 重算 |
 | GET | `/api/pagerank?top=` | PageRank 中心性 |

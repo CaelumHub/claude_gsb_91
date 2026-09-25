@@ -399,6 +399,130 @@ class SocialGraphService:
             return communities[uid]
         return -1
 
+    # ------------------------------------------------------------------
+    # Community-collapsed graph view
+    # ------------------------------------------------------------------
+    def community_view(self, expanded: Optional[Set[int]] = None) -> dict:
+        """Aggregate the graph into community super-nodes.
+
+        Every community collapses into one representative node whose ``size``
+        is its member count; edges between collapsed communities merge into a
+        single aggregate edge whose ``count`` is the number of underlying
+        edges.  Communities listed in ``expanded`` are instead emitted as
+        their member nodes: intra-community edges stay individual, and edges
+        towards a still-collapsed community aggregate per (member, community)
+        pair -- so the total edge count is preserved in every expand/collapse
+        state (``sum(edge counts) + sum(internal_edges of collapsed nodes)``
+        always equals ``graph.edge_count``).
+
+        Nodes without a community assignment (stale/missing Louvain cache)
+        fall into the synthetic community ``-1``.
+        """
+        graph = self.get_graph()
+        users = self.store.load_users()
+        expanded = set(expanded or set())
+
+        # The on-disk community cache stores node ids as strings; normalise.
+        raw_community = self.get_community().get("communities", {})
+        node_comm: Dict[int, int] = {}
+        for key, cid in raw_community.items():
+            try:
+                node_comm[int(key)] = int(cid)
+            except (TypeError, ValueError):
+                continue
+
+        members: Dict[int, List[int]] = defaultdict(list)
+        for nid in graph.nodes:
+            members[node_comm.get(nid, -1)].append(nid)
+
+        intra_count: Dict[int, int] = defaultdict(int)
+        inter_count: Dict[Tuple[int, int], int] = defaultdict(int)
+        expanded_intra: Dict[int, List[Tuple[int, int, float]]] = defaultdict(list)
+        expanded_cross: Dict[Tuple[int, int], List[Tuple[int, int, float]]] = defaultdict(list)
+
+        for u, v, w in graph.iter_edges():
+            if u > v:
+                continue  # frozen CSR yields each undirected edge twice
+            cu = node_comm.get(u, -1)
+            cv = node_comm.get(v, -1)
+            if cu == cv:
+                intra_count[cu] += 1
+                if cu in expanded:
+                    expanded_intra[cu].append((u, v, w))
+            else:
+                key = (cu, cv) if cu < cv else (cv, cu)
+                inter_count[key] += 1
+                if cu in expanded or cv in expanded:
+                    expanded_cross[key].append((u, v, w))
+
+        nodes: List[dict] = []
+        edges: List[dict] = []
+
+        for cid in sorted(members):
+            ids = members[cid]
+            if cid in expanded:
+                for nid in sorted(ids):
+                    nodes.append({
+                        "id": nid,
+                        "label": users.get(nid, {}).get("name", str(nid)),
+                        "degree": graph.degree(nid),
+                        "community": cid,
+                    })
+            else:
+                external = 0
+                for (a, b), cnt in inter_count.items():
+                    if a == cid or b == cid:
+                        external += cnt
+                nodes.append({
+                    "id": f"c{cid}",
+                    "community": cid,
+                    "size": len(ids),
+                    "internal_edges": intra_count.get(cid, 0),
+                    "external_edges": external,
+                })
+
+        # Collapsed <-> collapsed: one aggregate edge per community pair.
+        for (ca, cb), cnt in sorted(inter_count.items()):
+            if ca in expanded or cb in expanded:
+                continue
+            edges.append({"from": f"c{ca}", "to": f"c{cb}", "count": cnt})
+
+        # Expanded community internals: individual edges.
+        for cid in sorted(expanded_intra):
+            for u, v, w in expanded_intra[cid]:
+                edges.append({"from": u, "to": v, "weight": round(w, 3)})
+
+        # Edges touching exactly one expanded community.
+        for (ca, cb) in sorted(expanded_cross):
+            cross = expanded_cross[(ca, cb)]
+            if ca in expanded and cb in expanded:
+                for u, v, w in cross:
+                    edges.append({"from": u, "to": v, "weight": round(w, 3)})
+            else:
+                collapsed = cb if ca in expanded else ca
+                per_member: Dict[int, int] = defaultdict(int)
+                for u, v, _w in cross:
+                    member = u if node_comm.get(u, -1) in expanded else v
+                    per_member[member] += 1
+                for member, cnt in sorted(per_member.items()):
+                    edges.append({"from": member, "to": f"c{collapsed}", "count": cnt})
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "expanded": sorted(expanded),
+            "stats": {
+                "computed": bool(node_comm),
+                "communities": len(members),
+                "nodes": graph.node_count,
+                "edges": graph.edge_count,
+                "view_nodes": len(nodes),
+                "view_edges": len(edges),
+                "intra_edges": sum(intra_count.values()),
+                "inter_edges": sum(inter_count.values()),
+            },
+        }
+
     def compute_pagerank(self, top: int = 20, force: bool = False) -> dict:
         with self._lock:
             if (
