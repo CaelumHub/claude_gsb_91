@@ -390,14 +390,138 @@ class SocialGraphService:
             "computed_at": 0,
         }
 
+    def _community_partition(self) -> dict:
+        """Return the ``{node_id: community_id}`` partition.
+
+        Used by the collapsed community view; runs Louvain on first use so the
+        view always has a partition to aggregate with.
+        """
+        partition = self.get_community().get("communities") or {}
+        if not partition:
+            partition = self.compute_community().get("communities", {})
+        return partition
+
+    def community_overview(self) -> dict:
+        """Aggregate the graph to community level.
+
+        Produces one representative node per community (``size`` is the member
+        count, ``internal_edges`` the number of edges with both ends inside the
+        community) and one edge per community pair whose ``count`` is the
+        number of underlying edges between the two communities.  Internal
+        edges are counted on the node rather than emitted as self-loops.
+        """
+        graph = self.get_graph()
+        partition = self._community_partition()
+
+        sizes: Dict[int, int] = defaultdict(int)
+        internal: Dict[int, int] = defaultdict(int)
+        between: Counter = Counter()
+        for nid in graph.nodes:
+            sizes[_community_id(partition, nid)] += 1
+        # The frozen CSR yields each undirected edge in both directions, so we
+        # count only the canonical u < v orientation -- once per real edge.
+        for u, v, _w in graph.iter_edges():
+            if u >= v:
+                continue
+            cu = _community_id(partition, u)
+            cv = _community_id(partition, v)
+            if cu == cv:
+                internal[cu] += 1
+            else:
+                key = (cu, cv) if cu < cv else (cv, cu)
+                between[key] += 1
+
+        nodes = []
+        for cid in sorted(sizes):
+            cross = sum(
+                cnt for (a, b), cnt in between.items() if a == cid or b == cid
+            )
+            label = f"社群 {cid}" if cid >= 0 else "未归属"
+            nodes.append({
+                "id": f"c{cid}",
+                "community": cid,
+                "label": label,
+                "size": sizes[cid],
+                "internal_edges": internal.get(cid, 0),
+                "external_edges": cross,
+            })
+        edges = [
+            {
+                "from": f"c{cu}",
+                "to": f"c{cv}",
+                "from_community": cu,
+                "to_community": cv,
+                "count": cnt,
+            }
+            for (cu, cv), cnt in sorted(between.items())
+        ]
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "stats": {
+                "nodes": graph.node_count,
+                "edges": graph.edge_count,
+                "communities": len(sizes),
+                "internal_edges": sum(internal.values()),
+                "cross_edges": sum(between.values()),
+            },
+        }
+
+    def community_expansion(self, community_id: int) -> Optional[dict]:
+        """Expand one community: its members plus every edge incident to them.
+
+        * Internal edges (member-to-member) are emitted exactly once.
+        * External edges always run ``from`` a member ``to`` an outside node,
+          and the outside node's community is given in ``node_community`` so
+          the frontend can route the edge either to that community's
+          representative node (when it stays collapsed) or directly to the
+          member node (when it is expanded too).
+        """
+        graph = self.get_graph()
+        partition = self._community_partition()
+        members = sorted(
+            nid for nid in graph.nodes
+            if _community_id(partition, nid) == community_id
+        )
+        if not members:
+            return None
+        member_set = set(members)
+        users = self.store.load_users()
+        nodes = [
+            {
+                "id": nid,
+                "label": users.get(nid, {}).get("name", str(nid)),
+                "degree": graph.degree(nid),
+                "community": community_id,
+            }
+            for nid in members
+        ]
+        edges = []
+        node_community: Dict[int, int] = {}
+        internal_count = 0
+        for m in members:
+            for n, w in graph.neighbors_with_weights(m):
+                if n in member_set:
+                    if m < n:  # internal edge seen from both member rows
+                        edges.append({"from": m, "to": n, "weight": round(w, 3)})
+                        internal_count += 1
+                else:
+                    edges.append({"from": m, "to": n, "weight": round(w, 3)})
+                    node_community[n] = _community_id(partition, n)
+        edges.sort(key=lambda e: (e["from"], e["to"]))
+        return {
+            "community": community_id,
+            "nodes": nodes,
+            "edges": edges,
+            "node_community": node_community,
+            "internal_edges": internal_count,
+        }
+
     def _community_of(self, uid: int) -> int:
-        comm = self.get_community()
-        communities = comm.get("communities", {})
-        if not communities:
+        partition = self.get_community().get("communities", {})
+        if not partition:
             return -1
-        if uid in communities:
-            return communities[uid]
-        return -1
+        return _community_id(partition, uid)
 
     def compute_pagerank(self, top: int = 20, force: bool = False) -> dict:
         with self._lock:
@@ -570,6 +694,19 @@ class SocialGraphService:
             "profiles": len(profiles),
             "shards": self.store.shard_usage(),
         }
+
+
+def _community_id(partition: dict, node: int) -> int:
+    """Look up ``node``'s community, tolerating str/int partition keys.
+
+    Louvain results are persisted to JSON (object keys become strings), so a
+    partition loaded from ``community.json`` is keyed by ``str(node)`` while an
+    in-memory one may use ints.  Returns -1 when the node is unassigned.
+    """
+    comm = partition.get(node)
+    if comm is None:
+        comm = partition.get(str(node), -1)
+    return comm
 
 
 def _count_components(graph: Graph) -> int:

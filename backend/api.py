@@ -21,6 +21,8 @@ Endpoint summary (all under ``/api``):
     POST   /api/import                {edges:[[u,v],...], source}
     GET    /api/graph                 ?limit&community&top
     GET    /api/graph/neighborhood    ?node&depth&limit
+    GET    /api/graph/communities     (community-collapsed aggregate view)
+    GET    /api/graph/communities/<id>  (expand one community: members + edges)
     GET    /api/path                  ?source&target&algorithm
     GET    /api/common-friends        ?source&target
     GET    /api/community             (cached)
@@ -89,6 +91,14 @@ def _to_bool(value: Optional[str], default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def _community_of(partition: dict, node: int) -> int:
+    """Community of ``node``; tolerates str/int keys (JSON round-trip)."""
+    comm = partition.get(node)
+    if comm is None:
+        comm = partition.get(str(node), -1)
+    return comm
 
 
 class ApiRouter:
@@ -200,14 +210,11 @@ class ApiRouter:
             community = self.service.get_community().get("communities", {})
             nodes = []
             for nid in graph.nodes:
-                comm = -1
-                if nid in community:
-                    comm = community[nid]
                 nodes.append({
                     "id": nid,
                     "label": users.get(nid, {}).get("name", str(nid)),
                     "degree": graph.degree(nid),
-                    "community": comm,
+                    "community": _community_of(community, nid),
                 })
                 if len(nodes) >= limit:
                     break
@@ -234,20 +241,27 @@ class ApiRouter:
             community = self.service.get_community().get("communities", {})
             nodes = []
             for nid in graph.nodes:
-                comm = -1
-                if nid in community:
-                    comm = community[nid]
                 nodes.append({
                     "id": nid,
                     "label": users.get(nid, {}).get("name", str(nid)),
                     "degree": graph.degree(nid),
-                    "community": comm,
+                    "community": _community_of(community, nid),
                 })
             edges = [
                 {"from": u, "to": v, "weight": round(w, 3)}
                 for u, v, w in graph.iter_edges()
             ]
             return 200, {"root": node, "depth": depth, "nodes": nodes, "edges": edges}
+
+        # --- community-collapsed graph view ---
+        if route == "/graph/communities" and method == "GET":
+            return 200, self.service.community_overview()
+        m = re.fullmatch(r"/graph/communities/(-?\d+)", route)
+        if m and method == "GET":
+            detail = self.service.community_expansion(int(m.group(1)))
+            if detail is None:
+                return _error("社群不存在", 404)
+            return 200, detail
 
         # --- shortest path ---
         if route == "/path" and method == "GET":

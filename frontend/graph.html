@@ -16,10 +16,12 @@
         <div class="page-head">
           <div>
             <h1>图可视化</h1>
-            <p class="desc">vis.js 交互式网络图：滚轮缩放、拖拽平移、节点点击查看邻居、路径高亮、社群着色。</p>
+            <p class="desc">vis.js 交互式网络图：滚轮缩放、拖拽平移、节点点击查看邻居、路径高亮、社群着色；社群折叠视图按社群聚合成大节点，单击展开、双击收回。</p>
           </div>
           <div class="actions">
             <button class="btn" id="btnFull">全图</button>
+            <button class="btn" id="btnComm">社群折叠</button>
+            <button class="btn" id="btnCollapseAll" style="display:none">全部收起</button>
             <button class="btn" id="btnFit">适应视图</button>
             <button class="btn" id="btnPhysics">物理引擎</button>
             <button class="btn btn-primary" id="btnReload">重新加载</button>
@@ -75,8 +77,15 @@
     let currentNodes = [];   // {id,label,degree,community}
     let currentEdges = [];   // {from,to,weight}
     let communityMap = {};   // community -> {label,color}
-    let mode = "full";
+    let mode = "full";       // full | neighborhood | community
     let physicsOn = true;
+
+    // ---- 社群折叠视图状态 ----
+    let agg = null;              // /api/graph/communities 聚合结果
+    let expanded = new Set();    // 已展开的社群 id
+    let expandCache = {};        // 社群 id -> 展开数据（成员 + 关联边）
+    let positionSeeds = {};      // 社群 id -> 成员初始布局位置（围绕原代表节点）
+    let networkMode = null;      // 当前 network 实例服务的模式（事件绑定不同）
 
     const OPTIONS = {
       nodes: {
@@ -134,6 +143,7 @@
 
     function renderGraph(nodes, edges, legendTitle) {
       const { nodeArr, edgeArr } = buildGraphData(nodes, edges);
+      if (network) { network.destroy(); network = null; }
       nodesData = new vis.DataSet(nodeArr);
       edgesData = new vis.DataSet(edgeArr);
       currentNodes = nodes;
@@ -141,6 +151,7 @@
 
       const container = document.getElementById("network");
       network = new vis.Network(container, { nodes: nodesData, edges: edgesData }, OPTIONS);
+      networkMode = "standard";
 
       network.on("click", (params) => {
         if (params.nodes.length) {
@@ -170,6 +181,11 @@
     }
 
     function showNodeInfo(id) {
+      // 折叠态的社群代表节点（字符串 id，形如 "c3"）。
+      if (typeof id === "string" && id.indexOf("c") === 0) {
+        showCollapsedCommunityInfo(parseInt(id.slice(1), 10));
+        return;
+      }
       const n = currentNodes.find((x) => x.id === id);
       if (!n) return;
       const box = document.getElementById("nodeInfo");
@@ -179,16 +195,346 @@
         '<span class="badge brand">ID ' + id + "</span>" +
         '<strong>' + C.escapeHtml(n.label) + "</strong>" +
         '<span class="badge info">度数 ' + n.degree + "</span>" +
-        (n.community >= 0 ? '<span class="badge">社群 ' + n.community + "</span>" : "") +
+        (n.community >= 0 ? '<span class="badge" style="background:' + C.colorFor(n.community) + '22;color:' + C.colorFor(n.community) + '">社群 ' + n.community + "</span>" : "") +
         "</div>" +
-        '<div class="mt-8">标签：' + (tags || '<span class="faint">无</span>') + "</div>";
+        '<div class="mt-8">标签：' + (tags || '<span class="faint">无</span>') + "</div>" +
+        // 折叠视图下，成员所属社群已展开时提供“收起”入口（也可双击成员收回）。
+        (mode === "community" && n.community >= 0 && expanded.has(n.community)
+          ? '<div class="mt-8"><button class="btn btn-sm" id="btnCollapseOne">收起社群 ' + n.community + "（双击成员同样可收回）</button></div>"
+          : "");
+      const btn = document.getElementById("btnCollapseOne");
+      if (btn) btn.addEventListener("click", () => collapseCommunity(n.community));
+    }
+
+    function showCollapsedCommunityInfo(cid) {
+      const c = (agg && agg.nodes.find((x) => x.community === cid)) || null;
+      if (!c) return;
+      const box = document.getElementById("nodeInfo");
+      box.innerHTML =
+        '<div class="row wrap">' +
+        '<span class="swatch" style="width:12px;height:12px;border-radius:3px;background:' + C.colorFor(cid) + '"></span>' +
+        "<strong>" + C.escapeHtml(c.label) + "</strong>" +
+        '<span class="badge info">成员 ' + c.size + " 人</span>" +
+        '<span class="badge">内部边 ' + c.internal_edges + " 条</span>" +
+        '<span class="badge">跨社群边 ' + c.external_edges + " 条</span>" +
+        "</div>" +
+        '<div class="mt-8 small muted">单击该大节点可展开查看内部成员（双击成员或点“收起”收回）。</div>';
+    }
+
+    // ===================================================================
+    // 社群折叠视图（聚合数据由服务端生成，前端只负责渲染与交互）
+    // ===================================================================
+    function commNodeSize(size) {
+      // 平方根缩放：规模差异可见，但大社群不会撑满画布。
+      return Math.min(64, Math.round(16 + Math.sqrt(size) * 2.4));
+    }
+    function aggEdgeWidth(count) {
+      // 对数缩放：跨社群连边数量反映为边的粗细。
+      return Math.min(14, Math.round((1.5 + Math.log(1 + count) * 2.2) * 10) / 10);
+    }
+
+    function buildCommunityDatasets(positions) {
+      positions = positions || {};
+      const nodeArr = [];
+      const edgeArr = [];
+      const rawNodes = [];
+      const edgeKeys = new Set();
+      const memberKey = (m) => "m" + m;
+      const crossKey = (m, cid) => "x" + m + "#" + cid;
+
+      // --- 节点：未展开社群一个代表节点；已展开社群渲染成员 ---
+      for (const c of agg.nodes) {
+        const cid = c.community;
+        const col = C.colorFor(cid);
+        if (expanded.has(cid)) {
+          const ex = expandCache[cid];
+          for (const n of ex.nodes) {
+            const pos = positions[n.id] ||
+                        (positionSeeds[cid] && positionSeeds[cid][n.id]);
+            const node = {
+              id: n.id,
+              label: n.label || String(n.id),
+              title: "<b>" + (n.label || n.id) + "</b><br>ID: " + n.id +
+                     "<br>度数: " + n.degree + "<br>社群: " + cid +
+                     "<br><span class='faint'>双击可收起该社群</span>",
+              color: { background: col, border: "#ffffff", highlight: { background: col, border: "#333" } },
+              value: 1 + Math.log(1 + (n.degree || 0)),
+            };
+            if (pos) { node.x = pos.x; node.y = pos.y; }
+            nodeArr.push(node);
+            rawNodes.push(n);
+          }
+        } else {
+          const seedRep = positionSeeds[cid] && positionSeeds[cid].rep;
+          const pos = positions["c" + cid] || seedRep;
+          const node = {
+            id: "c" + cid,
+            label: c.label + "\n" + c.size + " 人",
+            title: "<b>" + C.escapeHtml(c.label) + "</b><br>成员: " + c.size + " 人" +
+                   "<br>内部边: " + c.internal_edges + " 条" +
+                   "<br>跨社群边: " + c.external_edges + " 条<br>点击展开",
+            color: { background: col, border: "#ffffff", borderWidth: 2.5,
+                     highlight: { background: col, border: "#333333" } },
+            size: commNodeSize(c.size),
+            font: { size: 13, bold: true, color: "#33405a",
+                    face: "PingFang SC, Microsoft YaHei, sans-serif" },
+          };
+          if (pos) { node.x = pos.x; node.y = pos.y; }
+          nodeArr.push(node);
+          rawNodes.push({ id: "c" + cid, community: cid, label: c.label,
+                          size: c.size, internal_edges: c.internal_edges,
+                          external_edges: c.external_edges, degree: null });
+        }
+      }
+
+      // --- 两个都未展开的社群：直接使用服务端聚合边 ---
+      for (const e of agg.edges) {
+        const a = e.from_community, b = e.to_community;
+        if (expanded.has(a) || expanded.has(b)) continue;
+        edgeArr.push({
+          from: "c" + a, to: "c" + b,
+          width: aggEdgeWidth(e.count),
+          value: e.count,
+          title: "社群 " + a + " ↔ 社群 " + b + "：" + e.count + " 条连边",
+          color: { color: "#8fa0bb", opacity: 0.55, highlight: "#4f8cff" },
+          smooth: { enabled: true, type: "continuous", roundness: 0.5 },
+        });
+      }
+
+      // --- 已展开社群的边：内部边原样；外部边按另一端的展开状态决定落点 ---
+      const pendingCross = {};   // crossKey -> {m, cid, count}
+      for (const cid of expanded) {
+        const ex = expandCache[cid];
+        const col = C.colorFor(cid);
+        for (const e of ex.edges) {
+          const otherComm = Object.prototype.hasOwnProperty.call(ex.node_community, e.to)
+            ? ex.node_community[e.to] : cid;
+          if (otherComm === cid) {
+            // 内部边：服务端已保证每对成员仅一条。
+            const key = memberKey(Math.min(e.from, e.to)) + "-" + memberKey(Math.max(e.from, e.to));
+            if (edgeKeys.has(key)) continue;
+            edgeKeys.add(key);
+            edgeArr.push({
+              from: e.from, to: e.to,
+              width: 1.2, value: 1,
+              color: { color: col, opacity: 0.5 },
+              title: "内部边（社群 " + cid + "）",
+              smooth: { enabled: false },
+            });
+          } else if (expanded.has(otherComm)) {
+            // 两端社群都展开：成员-成员直连（两个社群的展开数据都会带上它，去重）。
+            const key = memberKey(Math.min(e.from, e.to)) + "-" + memberKey(Math.max(e.from, e.to));
+            if (edgeKeys.has(key)) continue;
+            edgeKeys.add(key);
+            edgeArr.push({
+              from: e.from, to: e.to,
+              width: 1.1, value: 1,
+              color: { color: "#b9c4d6", opacity: 0.4 },
+              title: "跨社群边（社群 " + cid + " → 社群 " + otherComm + "）",
+              smooth: { enabled: false },
+            });
+          } else {
+            // 另一端仍折叠：把同一“成员 ↔ 社群”的边聚合成一条。
+            const key = crossKey(e.from, otherComm);
+            if (!pendingCross[key]) {
+              pendingCross[key] = { m: e.from, cid: otherComm, count: 0 };
+            }
+            pendingCross[key].count += 1;
+          }
+        }
+      }
+      for (const key in pendingCross) {
+        const p = pendingCross[key];
+        edgeArr.push({
+          from: p.m, to: "c" + p.cid,
+          width: aggEdgeWidth(p.count),
+          value: p.count,
+          title: "成员 → 社群 " + p.cid + "：" + p.count + " 条连边",
+          color: { color: "#8fa0bb", opacity: 0.5 },
+          smooth: { enabled: false },
+        });
+      }
+      return { nodeArr, edgeArr, rawNodes };
+    }
+
+    function bindCommunityEvents() {
+      network.on("click", (params) => {
+        if (!params.nodes.length) return;
+        const id = params.nodes[0];
+        if (typeof id === "string" && id.indexOf("c") === 0) {
+          expandCommunity(parseInt(id.slice(1), 10));   // 单击代表节点：展开
+        } else {
+          showNodeInfo(id);
+        }
+      });
+      // 双击成员节点：收起其所属社群。
+      network.on("doubleClick", (params) => {
+        if (!params.nodes.length) return;
+        const id = params.nodes[0];
+        if (typeof id !== "number") return;
+        const n = currentNodes.find((x) => x.id === id);
+        if (n && n.community >= 0 && expanded.has(n.community)) collapseCommunity(n.community);
+      });
+      network.once("stabilizationIterationsDone", () => { network.fit(); });
+    }
+
+    function renderCommunityView() {
+      // 保留当前可见节点的画布坐标，使展开/收回只影响目标社群、其余节点不跳动。
+      let positions = {};
+      if (network && networkMode === "community" && nodesData) {
+        positions = network.getPositions();
+      }
+      const { nodeArr, edgeArr, rawNodes } = buildCommunityDatasets(positions);
+      if (!network || networkMode !== "community") {
+        if (network) { network.destroy(); network = null; }
+        nodesData = new vis.DataSet(nodeArr);
+        edgesData = new vis.DataSet(edgeArr);
+        network = new vis.Network(document.getElementById("network"),
+                                  { nodes: nodesData, edges: edgesData }, OPTIONS);
+        networkMode = "community";
+        bindCommunityEvents();
+      } else {
+        nodesData.clear(); nodesData.add(nodeArr);
+        edgesData.clear(); edgesData.add(edgeArr);
+      }
+      currentNodes = rawNodes;
+      currentEdges = [];   // 折叠视图边由 DataSet 直接构造，高亮路径不适用
+      renderCommunityLegend();
+    }
+
+    function seedPositionsFor(cid, center, radius) {
+      const ex = expandCache[cid];
+      const n = ex.nodes.length;
+      const seeds = {};
+      ex.nodes.forEach((node, i) => {
+        const angle = (i / Math.max(n, 1)) * Math.PI * 2;
+        seeds[node.id] = {
+          x: center.x + Math.cos(angle) * radius,
+          y: center.y + Math.sin(angle) * radius,
+        };
+      });
+      seeds.rep = center;
+      positionSeeds[cid] = seeds;
+    }
+
+    async function expandCommunity(cid) {
+      if (expanded.has(cid)) { showExpandedCommunityInfo(cid); return; }
+      const box = document.getElementById("nodeInfo");
+      box.innerHTML = C.spinner();
+      try {
+        if (!expandCache[cid]) expandCache[cid] = await api.communityExpand(cid);
+        // 记录代表节点当前位置，让成员从原社群位置“散开”，其他社群位置保持稳定。
+        const repPos = network ? network.getPositions(["c" + cid])["c" + cid] : null;
+        if (repPos) seedPositionsFor(cid, repPos, 20 + Math.sqrt(expandCache[cid].nodes.length) * 7);
+        expanded.add(cid);
+        renderCommunityView();
+        showExpandedCommunityInfo(cid);
+      } catch (e) {
+        box.innerHTML = C.emptyState("⚠", e.message);
+      }
+    }
+
+    function collapseCommunity(cid) {
+      if (!expanded.has(cid)) return;
+      // 收回时把代表节点放回成员的质心，减少视图跳动。
+      const ex = expandCache[cid];
+      const ids = ex.nodes.map((n) => n.id);
+      const pos = network ? network.getPositions(ids) : {};
+      let sx = 0, sy = 0, k = 0;
+      for (const i in pos) { sx += pos[i].x; sy += pos[i].y; k++; }
+      if (k) {
+        positionSeeds[cid] = Object.assign({}, positionSeeds[cid] || {});
+        positionSeeds[cid].rep = { x: sx / k, y: sy / k };
+      }
+      expanded.delete(cid);
+      renderCommunityView();
+      const box = document.getElementById("nodeInfo");
+      box.innerHTML =
+        '<div class="row wrap"><strong>社群 ' + cid + " 已收回</strong></div>" +
+        '<div class="mt-8 small muted">单击大节点可再次展开。</div>';
+    }
+
+    function collapseAllCommunities() {
+      if (!expanded.size) return;
+      expanded.clear();
+      renderCommunityView();
+      document.getElementById("nodeInfo").innerHTML =
+        '<span class="small muted">所有社群已收起。共 ' + agg.nodes.length +
+        " 个社群，" + agg.stats.nodes + " 个成员。单击大节点展开。</span>";
+    }
+
+    function showExpandedCommunityInfo(cid) {
+      const ex = expandCache[cid];
+      if (!ex) return;
+      const external = ex.edges.length - ex.internal_edges;
+      const box = document.getElementById("nodeInfo");
+      box.innerHTML =
+        '<div class="row wrap">' +
+        '<span class="swatch" style="width:12px;height:12px;border-radius:3px;background:' + C.colorFor(cid) + '"></span>' +
+        "<strong>社群 " + cid + "（已展开）</strong>" +
+        '<span class="badge info">成员 ' + ex.nodes.length + " 人</span>" +
+        '<span class="badge">内部边 ' + ex.internal_edges + " 条</span>" +
+        '<span class="badge">跨社群边 ' + external + " 条</span>" +
+        '<button class="btn btn-sm" id="btnCollapseOneNow">收起社群 ' + cid + "</button>" +
+        "</div>" +
+        '<div class="mt-8 small muted">双击任意成员节点也可收回该社群。</div>';
+      document.getElementById("btnCollapseOneNow").addEventListener("click", () => collapseCommunity(cid));
+    }
+
+    function renderCommunityLegend() {
+      let html = "<strong>社群折叠视图</strong>" +
+        '<div class="faint small mb-8">单击大节点展开 · 双击成员收回</div>';
+      for (const c of agg.nodes) {
+        const cid = c.community;
+        const on = expanded.has(cid);
+        html += '<div class="lg-item" style="cursor:pointer" data-comm="' + cid + '" title="点击' + (on ? "收起" : "展开") + '">' +
+                '<span class="swatch" style="background:' + C.colorFor(cid) + '"></span>' +
+                C.escapeHtml(c.label) +
+                ' <span class="faint">(' + c.size + " 人" +
+                (c.external_edges ? " · " + c.external_edges + " 跨边" : "") + ")</span>" +
+                (on ? ' <span class="badge btn-sm" style="padding:0 6px">−</span>' : "") +
+                "</div>";
+      }
+      const legend = document.getElementById("legend");
+      legend.innerHTML = html;
+      legend.querySelectorAll("[data-comm]").forEach((el) => {
+        el.addEventListener("click", () => {
+          const cid = parseInt(el.dataset.comm, 10);
+          if (expanded.has(cid)) collapseCommunity(cid);
+          else expandCommunity(cid);
+        });
+      });
+    }
+
+    function loadCommunityView() {
+      const box = document.getElementById("nodeInfo");
+      box.innerHTML = C.spinner();
+      mode = "community";
+      document.getElementById("btnCollapseAll").style.display = "";
+      expanded = new Set();
+      expandCache = {};
+      positionSeeds = {};
+      return api.communityGraph().then((d) => {
+        agg = d;
+        renderCommunityView();
+        box.innerHTML =
+          '<span class="small muted">社群折叠视图：' + d.nodes.length + " 个社群代表 " +
+          d.stats.nodes + " 个成员、" + d.stats.edges + " 条边（内部 " +
+          d.stats.internal_edges + " / 跨社群 " + d.stats.cross_edges + "）。" +
+          "节点大小表示社群规模，边粗细表示连边数量，单击大节点展开。</span>";
+      }).catch((e) => {
+        mode = "full";
+        document.getElementById("btnCollapseAll").style.display = "none";
+        box.innerHTML = C.emptyState("⚠", e.message);
+      });
     }
 
     function loadFull() {
       const box = document.getElementById("nodeInfo");
       box.innerHTML = C.spinner();
       mode = "full";
-      api.graph({ limit: 2000 }).then((d) => {
+      document.getElementById("btnCollapseAll").style.display = "none";
+      return api.graph({ limit: 2000 }).then((d) => {
         renderGraph(d.nodes, d.edges, "全图社群");
         box.innerHTML = '<span class="small muted">共 ' + d.stats.nodes + " 节点 / " + d.stats.edges + " 条边（显示前 " + d.nodes.length + " 节点）。点击节点查看详情。</span>";
       }).catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });
@@ -199,6 +545,7 @@
       const depth = parseInt(document.getElementById("focusDepth").value, 10);
       if (isNaN(id)) { C.toast("请输入有效节点 ID", "warning"); return; }
       mode = "neighborhood";
+      document.getElementById("btnCollapseAll").style.display = "none";
       api.neighborhood({ node: id, depth, limit: 1500 }).then((d) => {
         renderGraph(d.nodes, d.edges, "节点 " + id + " 的 " + depth + " 跳邻域");
         document.getElementById("nodeInfo").innerHTML =
@@ -206,49 +553,59 @@
       }).catch((e) => C.toast(e.message, "error"));
     }
 
-    function highlightPath() {
+    async function highlightPath() {
       const src = parseInt(document.getElementById("pathSrc").value, 10);
       const dst = parseInt(document.getElementById("pathDst").value, 10);
       if (isNaN(src) || isNaN(dst)) { C.toast("请输入起点与终点 ID", "warning"); return; }
-      api.shortestPath(src, dst).then((r) => {
-        if (!r.path) { C.toast("两节点之间无路径", "warning"); return; }
-        const pathSet = new Set(r.path);
-        // 高亮路径节点与边
-        const nodeArr = currentNodes.map((n) => {
-          const c = pathSet.has(n.id) ? "#e09a2f" : colorOf(n.community);
-          const onPath = pathSet.has(n.id);
-          return {
-            id: n.id, label: n.label || String(n.id),
-            color: { background: c, border: c },
-            borderWidth: onPath ? 3 : 1.5,
-            value: onPath ? 25 : (1 + Math.log(1 + (n.degree || 0))),
-            title: (n.label || n.id) + (onPath ? " · 路径上" : ""),
-          };
-        });
-        const edgeArr = currentEdges.map((e) => {
-          const i = r.path.indexOf(e.from);
-          const onPath = i >= 0 && r.path[i + 1] === e.to;
-          return {
-            from: e.from, to: e.to,
-            color: onPath ? { color: "#e09a2f", highlight: "#e09a2f", opacity: 1 } : { color: "#c8d2e0", opacity: 0.35 },
-            width: onPath ? 4 : 1,
-          };
-        });
-        nodesData.update(nodeArr);
-        edgesData.update(edgeArr);
-        document.getElementById("nodeInfo").innerHTML =
-          '<div class="row wrap"><span class="badge warning">最短路径（' + r.algorithm + "）</span>" +
-          '<span class="badge">距离 ' + r.distance + "</span></div>" +
-          '<div class="path-hops mt-8">' +
-          r.path.map((p, i) => (i ? '<span class="hop arrow">→</span>' : "") + '<span class="hop">' + p + "</span>").join("") +
-          "</div>";
-        network.fit({ nodes: r.path, animation: true });
-      }).catch((e) => C.toast(e.message, "error"));
+      // 折叠视图只含社群代表节点，路径高亮需要成员级全图：先切回全图再高亮。
+      if (mode === "community") {
+        await loadFull();
+      }
+      const r = await api.shortestPath(src, dst).catch((e) => { C.toast(e.message, "error"); });
+      if (!r) return;
+      if (!r.path) { C.toast("两节点之间无路径", "warning"); return; }
+      const pathSet = new Set(r.path);
+      // 高亮路径节点与边
+      const nodeArr = currentNodes.map((n) => {
+        const c = pathSet.has(n.id) ? "#e09a2f" : colorOf(n.community);
+        const onPath = pathSet.has(n.id);
+        return {
+          id: n.id, label: n.label || String(n.id),
+          color: { background: c, border: c },
+          borderWidth: onPath ? 3 : 1.5,
+          value: onPath ? 25 : (1 + Math.log(1 + (n.degree || 0))),
+          title: (n.label || n.id) + (onPath ? " · 路径上" : ""),
+        };
+      });
+      const edgeArr = currentEdges.map((e) => {
+        const i = r.path.indexOf(e.from);
+        const onPath = i >= 0 && r.path[i + 1] === e.to;
+        return {
+          from: e.from, to: e.to,
+          color: onPath ? { color: "#e09a2f", highlight: "#e09a2f", opacity: 1 } : { color: "#c8d2e0", opacity: 0.35 },
+          width: onPath ? 4 : 1,
+        };
+      });
+      nodesData.update(nodeArr);
+      edgesData.update(edgeArr);
+      document.getElementById("nodeInfo").innerHTML =
+        '<div class="row wrap"><span class="badge warning">最短路径（' + r.algorithm + "）</span>" +
+        '<span class="badge">距离 ' + r.distance + "</span></div>" +
+        '<div class="path-hops mt-8">' +
+        r.path.map((p, i) => (i ? '<span class="hop arrow">→</span>' : "") + '<span class="hop">' + p + "</span>").join("") +
+        "</div>";
+      network.fit({ nodes: r.path, animation: true });
     }
 
     C.initPage("graph", function () {
       document.getElementById("btnFull").addEventListener("click", loadFull);
-      document.getElementById("btnReload").addEventListener("click", () => { if (mode === "full") loadFull(); else focusNode(); });
+      document.getElementById("btnComm").addEventListener("click", loadCommunityView);
+      document.getElementById("btnCollapseAll").addEventListener("click", collapseAllCommunities);
+      document.getElementById("btnReload").addEventListener("click", () => {
+        if (mode === "community") loadCommunityView();
+        else if (mode === "neighborhood") focusNode();
+        else loadFull();
+      });
       document.getElementById("btnFocus").addEventListener("click", focusNode);
       document.getElementById("btnPath").addEventListener("click", highlightPath);
       document.getElementById("btnFit").addEventListener("click", () => { if (network) network.fit({ animation: true }); });

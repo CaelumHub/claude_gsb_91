@@ -130,6 +130,7 @@ gsb3/
 | POST | `/api/users/<id>/tags` | 设置用户标签 |
 | POST | `/api/import` | 批量导入边 |
 | GET | `/api/graph` · `/api/graph/neighborhood` | 全图 / 邻域子图 |
+| GET | `/api/graph/communities` · `/api/graph/communities/<id>` | 社群折叠聚合图 / 展开单个社群（成员+关联边） |
 | GET | `/api/path` · `/api/common-friends` | 最短路径 / 共同好友 |
 | GET/POST | `/api/community` · `/api/community/compute` | Louvain 结果 / 重算 |
 | GET | `/api/pagerank?top=` | PageRank 中心性 |
